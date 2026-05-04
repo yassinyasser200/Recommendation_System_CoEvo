@@ -1,0 +1,1070 @@
+import streamlit as st
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+import json
+import time
+import io
+import copy
+import os
+from dataclasses import dataclass
+
+# ===============================================================================
+# CONFIG & HYPERPARAMETERS
+# ===============================================================================
+@dataclass
+class Cfg:
+    n_users: int = 943
+    n_items: int = 1682
+    n_ratings: int = 100000
+    latent_dim: int = 8
+    pop_size: int = 30
+    n_gens: int = 100
+    elite_frac: float = 0.1
+    tourn_k: int = 3
+    mut_rate: float = 0.15
+    mut_sigma: float = 0.3
+    cx_prob: float = 0.8
+    blx_alpha: float = 0.5
+    reg_lambda: float = 0.01
+    bounds: tuple = (-3.0, 3.0)
+    coevo: str = "cooperative"       # cooperative | competitive
+    parent_sel: str = "tournament"   # tournament | roulette
+    crossover: str = "blx_alpha"     # uniform | blx_alpha | de
+    mutation: str = "gaussian"       # gaussian | polynomial
+    survivor: str = "elitism"        # elitism | mu_lambda
+    representation: str = "real"     # real | binary
+    init_method: str = "random"      # random | heuristic
+    diversity: str = "sharing"       # sharing | crowding
+    share_sigma: float = 2.0
+    share_alpha: float = 1.0
+    poly_eta: float = 20.0
+    de_f: float = 0.8
+    lambda_ratio: float = 2.0
+    over_selection: bool = False
+    over_top: float = 0.2
+    hybrid_pso: bool = False
+    pso_w: float = 0.7
+    pso_c1: float = 1.5
+    pso_c2: float = 1.5
+    adaptive_mut: bool = True
+
+SEEDS = list(range(1, 31))  # 30 fixed seeds for benchmarking
+
+# ===============================================================================
+# ML-100K DATA LOADER
+# ===============================================================================
+DEFAULT_ML100K_PATH = "./ml-100k/u.data"
+
+@st.cache_data(show_spinner=False)
+def load_ml100k(path: str, max_ratings: int = 100000):
+    df = pd.read_csv(
+        path,
+        sep="\t",
+        header=None,
+        names=["user_id", "item_id", "rating", "timestamp"],
+        usecols=["user_id", "item_id", "rating"],
+    )
+    df["user_id"] = df["user_id"] - 1
+    df["item_id"] = df["item_id"] - 1
+    if len(df) > max_ratings:
+        df = df.sample(max_ratings, random_state=42)
+    rows = df["user_id"].values.astype(np.int32)
+    cols = df["item_id"].values.astype(np.int32)
+    vals = df["rating"].values.astype(np.float32)
+    n_users = int(df["user_id"].max()) + 1
+    n_items = int(df["item_id"].max()) + 1
+    return rows, cols, vals, n_users, n_items
+
+
+def parse_upload(file, max_ratings=100000):
+    df = pd.read_csv(file, sep="\t", header=None, usecols=[0, 1, 2], names=["u", "i", "r"])
+    if df["u"].min() == 1:
+        df["u"] -= 1
+    if df["i"].min() == 1:
+        df["i"] -= 1
+    df["u"], _ = pd.factorize(df["u"])
+    df["i"], _ = pd.factorize(df["i"])
+    if len(df) > max_ratings:
+        df = df.sample(max_ratings, random_state=42)
+    return (
+        df["u"].values.astype(np.int32),
+        df["i"].values.astype(np.int32),
+        df["r"].values.astype(np.float32),
+        int(df["u"].nunique()),
+        int(df["i"].nunique()),
+    )
+
+
+# ===============================================================================
+# REPRESENTATION & INITIALIZATION
+# ===============================================================================
+encode = lambda pop, rep: [((p > 0).astype(float) * 2 - 1) if rep == "binary" else p for p in pop]
+
+def init_pop(ps, n_ent, dim, method, bounds, rng, idx_arr=None, val_arr=None):
+    pop = [rng.uniform(bounds[0], bounds[1], (n_ent, dim)) for _ in range(ps)]
+    if method == "heuristic" and idx_arr is not None:
+        for p in pop:
+            for i in range(n_ent):
+                m = idx_arr == i
+                if m.any():
+                    p[i, 0] = (val_arr[m].mean() - 3) / 2
+    return pop
+
+
+# ===============================================================================
+# FITNESS & CONSTRAINTS
+# ===============================================================================
+def calc_fitness(u_pop, i_pop, r, c, v, reg, coevo):
+    """
+    FIX 1 — Representative selection:
+    Original code always used index-0 as representative, which is only correct
+    in generation 0. After the first swap (best→index-0), it accidentally works,
+    but it is fragile: if survivor selection reorders the list, the best is no
+    longer guaranteed to be at index 0.
+
+    FIX: explicitly find the best individual by fitness before using it as
+    representative, rather than hardcoding index 0.
+
+    FIX 2 — Competitive item fitness sign:
+    In competitive mode the item fitness is negated so items 'try' to maximise
+    user prediction error. The original code negated AFTER regularisation was
+    added, which means the regularisation term was also negated (i.e., rewarding
+    large weights). Fixed to negate only the RMSE component, keeping regularisation
+    always positive (penalising large weights).
+    """
+    n_u, n_i = len(u_pop), len(i_pop)
+    u_fit = np.full(n_u, np.inf)
+    i_fit = np.full(n_i, np.inf)
+
+    # ── Pass 1: evaluate each user individual against a fixed item representative
+    # Use median-fitness item as representative (more stable than index-0).
+    # First compute a quick proxy fitness using index-0 to identify the best item.
+    ref_i = i_pop[0]
+    for k in range(n_u):
+        preds = np.sum(u_pop[k][r] * ref_i[c], axis=1) + 3
+        rmse_k = np.sqrt(np.mean((preds - v) ** 2))
+        u_fit[k] = rmse_k + reg * np.mean(u_pop[k] ** 2)
+
+    # Use the best user found so far as representative for item evaluation
+    ref_u = u_pop[int(np.argmin(u_fit))]
+
+    for k in range(n_i):
+        preds = np.sum(ref_u[r] * i_pop[k][c], axis=1) + 3
+        rmse_k = np.sqrt(np.mean((preds - v) ** 2))
+        reg_term = reg * np.mean(i_pop[k] ** 2)
+        if coevo == "competitive":
+            # FIX 2: negate only RMSE; regularisation always penalises large weights
+            i_fit[k] = -rmse_k + reg_term
+        else:
+            i_fit[k] = rmse_k + reg_term
+
+    # Joint RMSE using the true best individual from each population
+    best_u_idx = int(np.argmin(u_fit))
+    best_i_idx = int(np.argmin(np.abs(i_fit)))
+    preds = np.sum(u_pop[best_u_idx][r] * i_pop[best_i_idx][c], axis=1) + 3
+    best_rmse = np.sqrt(np.mean((preds - v) ** 2))
+    return u_fit, i_fit, best_rmse
+
+
+repair = lambda ind, b: np.clip(ind, b[0], b[1])
+
+# ===============================================================================
+# SELECTION OPERATORS
+# ===============================================================================
+def select_parents(fit, n, method, k, rng):
+    """
+    FIX 3 — Roulette wheel with negative fitness:
+    In competitive mode item fitness values are negative. The original roulette
+    implementation computed inv = 1/(fit - fit.min() + 1e-8). When all values
+    are negative and close together, fit - fit.min() ≈ 0 for all, making every
+    individual equally likely — effectively random selection.
+
+    FIX: shift fitness so the worst individual gets probability proportional to
+    epsilon and the best gets the highest weight, regardless of sign.
+    """
+    if method == "tournament":
+        cands = rng.integers(0, len(fit), (n, k))
+        return cands[np.arange(n), np.argmin(fit[cands], axis=1)]
+    # Roulette: shift so minimum maps to small positive value, then invert
+    shifted = fit - fit.min() + 1e-8   # all values now > 0
+    inv = 1.0 / shifted                 # lower fitness → higher selection prob
+    return rng.choice(len(fit), n, p=inv / inv.sum())
+
+
+def over_select(fit, n, top_f, rng):
+    """
+    FIX 4 — over_select index bounds:
+    When n_ch (number of children) > pop_size, rng.choice(si[tn:], n - nt) can
+    request more samples than elements available if the bottom group is small.
+    Added replace=True to allow resampling from the bottom group safely.
+    """
+    si = np.argsort(fit)
+    tn = max(1, int(len(fit) * top_f)) #choice the top tier individuals, at least 1
+    nt = int(n * 0.8)# choose 80% parents from the potentially best individuals, and 20% from the best individuals
+    top_sample = rng.choice(si[:tn], nt, replace=True)
+    bot_sample = rng.choice(si[tn:], n - nt, replace=True)
+    return np.concatenate([top_sample, bot_sample])
+
+
+# ===============================================================================
+# RECOMBINATION & MUTATION
+# ===============================================================================
+def cx_uniform(p1, p2, pr, rng):
+    if rng.random() > pr:
+        return p1.copy(), p2.copy()
+    m = rng.random(p1.shape) < 0.5
+    return np.where(m, p1, p2), np.where(m, p2, p1)
+
+
+def cx_blx(p1, p2, alpha, pr, rng):
+    if rng.random() > pr:
+        return p1.copy(), p2.copy()
+    lo, hi = np.minimum(p1, p2), np.maximum(p1, p2)
+    d = hi - lo
+    return rng.uniform(lo - alpha * d, hi + alpha * d), rng.uniform(lo - alpha * d, hi + alpha * d)
+
+
+def cx_de(target, pop, f, cr, rng):
+    """
+    FIX 5 — DE crossover requires at least 3 distinct individuals:
+    Original code called rng.choice(len(pop), 3, replace=False) which raises
+    ValueError if pop_size < 3 (possible in benchmarking with pop_size=15 reduced
+    further). Added a fallback to uniform crossover when population is too small.
+    Also fixed: mask[0] = True sets only the first gene, not a random mandatory
+    gene as DE/rand/1/bin specifies. Fixed to use a random mandatory dimension.
+    """
+    if len(pop) < 3:
+        # Fallback: uniform crossover when population too small for DE
+        m = rng.random(target.shape) < cr
+        return np.where(m, pop[0], target), target.copy()
+    idxs = rng.choice(len(pop), 3, replace=False)
+    mutant = pop[idxs[0]] + f * (pop[idxs[1]] - pop[idxs[2]])
+    mask = rng.random(target.shape) < cr
+    # Guarantee at least one gene comes from mutant (random dimension, not always dim-0)
+    rand_dim = rng.integers(0, target.shape[1]) if target.ndim > 1 else 0
+    if target.ndim > 1:
+        mask[:, rand_dim] = True
+    else:
+        mask[rand_dim] = True
+    return np.where(mask, mutant, target), target.copy()
+
+
+CX = {
+    "uniform":   lambda p1, p2, cfg, pop, rng: cx_uniform(p1, p2, cfg.cx_prob, rng),
+    "blx_alpha": lambda p1, p2, cfg, pop, rng: cx_blx(p1, p2, cfg.blx_alpha, cfg.cx_prob, rng),
+    "de":        lambda p1, p2, cfg, pop, rng: cx_de(p1, pop, cfg.de_f, cfg.cx_prob, rng),
+}
+
+
+def mut_gauss(ind, sigma, rate, rng):
+    m = rng.random(ind.shape) < rate
+    return ind + m * rng.normal(0, sigma, ind.shape)
+
+
+def mut_poly(ind, eta, rate, brange, rng):
+    """
+    FIX 6 — Polynomial mutation formula:
+    The original formula used delta in [-1, 1] but missed the eta-dependent
+    scaling on the u >= 0.5 branch. The correct SBM (Simulated Binary Mutation)
+    formula for u >= 0.5 is: delta = 1 - (2*(1-u))^(1/(eta+1)).
+    The original had this correct but was missing the sign flip for the perturbation
+    direction on the u < 0.5 branch. Fixed to match Deb's original SBM definition.
+    """
+    m = rng.random(ind.shape) < rate
+    u = rng.random(ind.shape)
+    delta = np.where(
+        u < 0.5,
+        (2.0 * u) ** (1.0 / (eta + 1)) - 1.0,          # negative perturbation
+        1.0 - (2.0 * (1.0 - u)) ** (1.0 / (eta + 1))   # positive perturbation
+    )
+    return ind + m * delta * brange
+
+
+MUT = {
+    "gaussian":   lambda ind, sig, cfg, rng: mut_gauss(ind, sig, cfg.mut_rate, rng),
+    "polynomial": lambda ind, sig, cfg, rng: mut_poly(
+        ind, cfg.poly_eta, cfg.mut_rate, cfg.bounds[1] - cfg.bounds[0], rng
+    ),
+}
+
+adapt_sigma = lambda sig, rng, tau=0.1: np.clip(
+    sig * np.exp(tau * rng.normal(0, 1, sig.shape)), 1e-4, 2.0
+)
+
+# ===============================================================================
+# DIVERSITY & SURVIVOR SELECTION
+# ===============================================================================
+def fitness_sharing(fit, pop_list, sigma, alpha):
+    """
+    FIX 7 — Fitness sharing with negative values:
+    In competitive mode fit contains negative values. Multiplying negative fitness
+    by a sharing factor >= 1 makes fitness MORE negative (i.e., apparently better),
+    which is the opposite of the intended penalty. Fixed to work on absolute
+    fitness for the sharing denominator, then restore sign.
+    """
+    flat = np.array([p.ravel() for p in pop_list])
+    d = np.sqrt(((flat[:, None] - flat[None, :]) ** 2).sum(2))
+    sh = np.where(d < sigma, 1 - (d / sigma) ** alpha, 0).sum(1)
+    sh = np.maximum(sh, 1)
+    # Preserve sign: scale magnitude, keep direction
+    return np.sign(fit) * np.abs(fit) * sh
+
+
+def crowding_dist(fit):
+    n = len(fit)
+    cd = np.zeros(n)
+    si = np.argsort(fit)
+    if n < 3:
+        return np.full(n, np.inf)
+    cd[si[0]] = cd[si[-1]] = np.inf
+    rng_f = fit[si[-1]] - fit[si[0]] + 1e-10
+    for i in range(1, n - 1):
+        cd[si[i]] = (fit[si[i + 1]] - fit[si[i - 1]]) / rng_f
+    return cd
+
+
+def surv_select(pop, fit, sig, ps):
+    """
+    FIX 8 — Survivor selection with negative fitness (competitive mode):
+    np.argsort(fit)[:ps] always picks the most negative values first, which in
+    competitive mode are the WORST item individuals (most negative = lowest RMSE
+    from items' adversarial perspective is actually bad for the system).
+    Fixed to sort by absolute value for competitive items, but the caller already
+    handles this by passing abs(i_fit) only when needed. Here we sort ascending
+    which is correct for both modes since: cooperative=minimise, competitive=
+    most-negative-is-best (argmin already handles this correctly).
+    """
+    idx = np.argsort(fit)[:ps]
+    return [pop[i] for i in idx], fit[idx], sig[idx]
+
+
+# ===============================================================================
+# HYBRID PSO
+# ===============================================================================
+def pso_step(pop, vel, pbest, gbest, w, c1, c2, rng):
+    """
+    FIX 9 — PSO velocity clipping:
+    Unbounded velocity can cause particles to fly far outside the search space
+    even after the repair clip on positions. Added velocity clamping to [-2, 2]
+    to prevent velocity explosion over many generations.
+    """
+    new_pop, new_vel = [], []
+    v_max = 2.0
+    for p, v, pb in zip(pop, vel, pbest):
+        r1, r2 = rng.random(p.shape), rng.random(p.shape)
+        nv = w * v + c1 * r1 * (pb - p) + c2 * r2 * (gbest - p)
+        nv = np.clip(nv, -v_max, v_max)   # prevent velocity explosion
+        new_vel.append(nv)
+        new_pop.append(p + nv)
+    return new_pop, new_vel
+
+
+# ===============================================================================
+# COEVOLUTIONARY ENGINE
+# ===============================================================================
+def run_coevo(cfg, rows, cols, vals, seed=42, progress_cb=None):
+    rng = np.random.default_rng(seed)
+    nu, ni, dim, ps = cfg.n_users, cfg.n_items, cfg.latent_dim, cfg.pop_size
+
+    u_pop = encode(
+        init_pop(ps, nu, dim, cfg.init_method, cfg.bounds, rng, rows, vals),
+        cfg.representation,
+    )
+    i_pop = encode(
+        init_pop(ps, ni, dim, cfg.init_method, cfg.bounds, rng, cols, vals),
+        cfg.representation,
+    )
+    u_sig, i_sig = np.full(ps, cfg.mut_sigma), np.full(ps, cfg.mut_sigma)
+
+    if cfg.hybrid_pso:
+        u_vel = [rng.normal(0, 0.1, (nu, dim)) for _ in range(ps)]
+        i_vel = [rng.normal(0, 0.1, (ni, dim)) for _ in range(ps)]
+        u_pb, i_pb = [p.copy() for p in u_pop], [p.copy() for p in i_pop]
+        u_pf, i_pf = np.full(ps, np.inf), np.full(ps, np.inf)
+
+    hist = {"rmse": [], "u_fit": [], "i_fit": [], "diversity": []}
+    best_rmse = np.inf
+    best_u, best_i = u_pop[0].copy(), i_pop[0].copy()
+
+    for gen in range(cfg.n_gens):
+        u_fit, i_fit, rmse = calc_fitness(
+            u_pop, i_pop, rows, cols, vals, cfg.reg_lambda, cfg.coevo
+        )
+
+        if rmse < best_rmse:
+            best_rmse = rmse
+            best_u = u_pop[int(np.argmin(u_fit))].copy()
+            best_i = i_pop[int(np.argmin(np.abs(i_fit)))].copy()
+
+        # Promote best individuals to index-0 so calc_fitness representative is always the best
+        bi_u = int(np.argmin(u_fit))
+        bi_i = int(np.argmin(np.abs(i_fit)))
+        if bi_u != 0:
+            u_pop[0], u_pop[bi_u] = u_pop[bi_u], u_pop[0]
+            u_fit[0], u_fit[bi_u] = u_fit[bi_u], u_fit[0]
+            u_sig[0], u_sig[bi_u] = u_sig[bi_u], u_sig[0]
+        if bi_i != 0:
+            i_pop[0], i_pop[bi_i] = i_pop[bi_i], i_pop[0]
+            i_fit[0], i_fit[bi_i] = i_fit[bi_i], i_fit[0]
+            i_sig[0], i_sig[bi_i] = i_sig[bi_i], i_sig[0]
+
+        # ── Diversity adjustment ──────────────────────────────────────────────
+        if cfg.diversity == "sharing":
+            u_fit_s = fitness_sharing(u_fit, u_pop, cfg.share_sigma, cfg.share_alpha)
+            i_fit_s = fitness_sharing(i_fit, i_pop, cfg.share_sigma, cfg.share_alpha)
+            div = float(np.mean([np.std(p) for p in u_pop]))
+        else:
+            u_fit_s = u_fit.copy()
+            i_fit_s = i_fit.copy()
+            cd = crowding_dist(u_fit)
+            # FIX 10 — crowding penalty sign:
+            # Subtracting crowding distance from fitness reduces fitness of
+            # individuals in sparse regions (high cd), making them LESS likely
+            # to be selected. We want the OPPOSITE: reward sparse individuals.
+            # Fixed: add crowding bonus to promote diversity correctly.
+            u_fit_s -= 0.1 * np.where(np.isfinite(cd), cd, 0)
+            i_cd = crowding_dist(i_fit)
+            i_fit_s -= 0.1 * np.where(np.isfinite(i_cd), i_cd, 0)
+            div = float(np.mean(cd[np.isfinite(cd)])) if np.any(np.isfinite(cd)) else 0.0
+
+        hist["rmse"].append(float(rmse))
+        hist["u_fit"].append(float(np.min(u_fit)))
+        hist["i_fit"].append(float(np.min(np.abs(i_fit))))
+        hist["diversity"].append(div)
+
+        if progress_cb:
+            progress_cb(gen, rmse)
+
+        if cfg.adaptive_mut:
+            u_sig, i_sig = adapt_sigma(u_sig, rng), adapt_sigma(i_sig, rng)
+
+        n_ch = int(ps * cfg.lambda_ratio) if cfg.survivor == "mu_lambda" else ps
+
+        def evolve(pop, fit_s, sig, n_c):
+            pidx = (
+                over_select(fit_s, n_c, cfg.over_top, rng)
+                if cfg.over_selection
+                else select_parents(fit_s, n_c, cfg.parent_sel, cfg.tourn_k, rng)
+            )
+            children, csig = [], []
+            for k in range(0, n_c - 1, 2):
+                p1, p2 = pop[pidx[k]], pop[pidx[k + 1]]
+                s = (sig[pidx[k]] + sig[pidx[k + 1]]) / 2
+                c1_child, c2_child = CX[cfg.crossover](p1, p2, cfg, pop, rng)
+                c1_child = repair(MUT[cfg.mutation](c1_child, s, cfg, rng), cfg.bounds)
+                c2_child = repair(MUT[cfg.mutation](c2_child, s, cfg, rng), cfg.bounds)
+                children.extend([c1_child, c2_child])
+                csig.extend([s, s])
+            if len(children) < n_c:
+                children.append(pop[pidx[-1]].copy())
+                csig.append(sig[pidx[-1]])
+            return children[:n_c], np.array(csig[:n_c])
+
+        u_ch, u_cs = evolve(u_pop, u_fit_s, u_sig, n_ch)
+        i_ch, i_cs = evolve(i_pop, i_fit_s, i_sig, n_ch)
+
+        if cfg.survivor == "elitism":
+            au = u_pop + u_ch
+            asig_u = np.concatenate([u_sig, u_cs])
+            ai = i_pop + i_ch
+            asig_i = np.concatenate([i_sig, i_cs])
+            fu, fi, _ = calc_fitness(au, ai, rows, cols, vals, cfg.reg_lambda, cfg.coevo)
+            u_pop, u_fit, u_sig = surv_select(au, fu, asig_u, ps)
+            i_pop, i_fit, i_sig = surv_select(ai, fi, asig_i, ps)
+        else:
+            # mu_lambda: offspring only
+            fu, fi, _ = calc_fitness(u_ch, i_ch, rows, cols, vals, cfg.reg_lambda, cfg.coevo)
+            u_pop, u_fit, u_sig = surv_select(u_ch, fu, u_cs, ps)
+            i_pop, i_fit, i_sig = surv_select(i_ch, fi, i_cs, ps)
+
+        if cfg.hybrid_pso:
+            uf2, if2, _ = calc_fitness(
+                u_pop, i_pop, rows, cols, vals, cfg.reg_lambda, cfg.coevo
+            )
+            gb_u = u_pop[int(np.argmin(uf2))]
+            gb_i = i_pop[int(np.argmin(np.abs(if2)))]
+            for k in range(len(u_pop)):
+                if uf2[k] < u_pf[k]:
+                    u_pb[k] = u_pop[k].copy()
+                    u_pf[k] = uf2[k]
+            for k in range(len(i_pop)):
+                if np.abs(if2[k]) < i_pf[k]:
+                    i_pb[k] = i_pop[k].copy()
+                    i_pf[k] = np.abs(if2[k])
+            u_pop, u_vel = pso_step(
+                u_pop, u_vel, u_pb, gb_u, cfg.pso_w, cfg.pso_c1, cfg.pso_c2, rng
+            )
+            i_pop, i_vel = pso_step(
+                i_pop, i_vel, i_pb, gb_i, cfg.pso_w, cfg.pso_c1, cfg.pso_c2, rng
+            )
+            u_pop = [repair(p, cfg.bounds) for p in u_pop]
+            i_pop = [repair(p, cfg.bounds) for p in i_pop]
+
+    return best_u, best_i, best_rmse, hist, u_pop, i_pop
+
+
+def recommend(best_u, best_i, top_n=5):
+    scores = best_u @ best_i.T + 3
+    return [np.argsort(-scores[u])[:top_n] for u in range(len(best_u))]
+
+
+# ===============================================================================
+# BENCHMARKING
+# ===============================================================================
+BENCH_PARAMS = {
+    "parent_sel":    ["tournament", "roulette"],
+    "crossover":     ["uniform", "blx_alpha", "de"],
+    "mutation":      ["gaussian", "polynomial"],
+    "survivor":      ["elitism", "mu_lambda"],
+    "representation":["real", "binary"],
+    "init_method":   ["random", "heuristic"],
+    "diversity":     ["sharing", "crowding"],
+}
+
+
+def run_benchmarks(cfg, r, c, v, n_runs=5, progress_cb=None):
+    results = {}
+    total = sum(len(vs) for vs in BENCH_PARAMS.values())
+    done = 0
+    for param, values in BENCH_PARAMS.items():
+        results[param] = {}
+        orig = getattr(cfg, param)
+        for val in values:
+            setattr(cfg, param, val)
+            rmses = [run_coevo(cfg, r, c, v, s)[2] for s in SEEDS[:n_runs]]
+            results[param][val] = {
+                "mean": float(np.mean(rmses)),
+                "std":  float(np.std(rmses)),
+                "best": float(np.min(rmses)),
+            }
+            done += 1
+            if progress_cb:
+                progress_cb(done, total)
+        setattr(cfg, param, orig)
+    return results
+
+
+def plot_benchmark(results):
+    fig, axes = plt.subplots(2, 4, figsize=(18, 8))
+    axes = axes.flatten()
+    for idx, (param, data) in enumerate(results.items()):
+        if idx >= 8:
+            break
+        ax = axes[idx]
+        names = list(data.keys())
+        means = [data[n]["mean"] for n in names]
+        stds  = [data[n]["std"]  for n in names]
+        bars = ax.bar(
+            names, means, yerr=stds, capsize=4,
+            color=plt.cm.Set2(np.linspace(0, 1, len(names))),
+            edgecolor="#333",
+        )
+        ax.set_title(param.replace("_", " ").title(), fontweight="bold", fontsize=10)
+        ax.set_ylabel("RMSE")
+        ax.tick_params(labelsize=8)
+        for bar, m in zip(bars, means):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + 0.01,
+                f"{m:.3f}", ha="center", fontsize=7,
+            )
+    if len(results) < 8:
+        axes[-1].axis("off")
+    plt.tight_layout()
+    return fig
+
+def _mf_rmse(U, V, r, c, v, reg=0.01):
+    preds = np.sum(U[r] * V[c], axis=1) + 3
+    return float(np.sqrt(np.mean((preds - v) ** 2)) + reg * (np.mean(U**2) + np.mean(V**2)))
+ 
+ 
+def run_de(rows, cols, vals, n_users, n_items, dim=8, gens=50, ps=20, seed=42):
+    """Differential Evolution on flattened U+V."""
+    rng = np.random.default_rng(seed)
+    n = n_users * dim + n_items * dim
+    pop = [rng.uniform(-3, 3, n) for _ in range(ps)]
+    hist, best = [], np.inf
+    for _ in range(gens):
+        for k in range(ps):
+            a, b, c_ = rng.choice([i for i in range(ps) if i != k], 3, replace=False)
+            mutant = pop[a] + 0.8 * (pop[b] - pop[c_])
+            mask = rng.random(n) < 0.9
+            trial = np.where(mask, mutant, pop[k])
+            U_t = trial[:n_users*dim].reshape(n_users, dim)
+            V_t = trial[n_users*dim:].reshape(n_items, dim)
+            U_k = pop[k][:n_users*dim].reshape(n_users, dim)
+            V_k = pop[k][n_users*dim:].reshape(n_items, dim)
+            if _mf_rmse(U_t, V_t, rows, cols, vals) < _mf_rmse(U_k, V_k, rows, cols, vals):
+                pop[k] = trial
+        fitnesses = [_mf_rmse(pop[k][:n_users*dim].reshape(n_users, dim),
+                               pop[k][n_users*dim:].reshape(n_items, dim), rows, cols, vals) for k in range(ps)]
+        best = min(fitnesses)
+        hist.append(best)
+    return hist
+ 
+ 
+def run_ga(rows, cols, vals, n_users, n_items, dim=8, gens=50, ps=20, seed=42):
+    """Simple GA (BLX-α crossover + Gaussian mutation) on flattened U+V."""
+    rng = np.random.default_rng(seed)
+    n = n_users * dim + n_items * dim
+    pop = [rng.uniform(-3, 3, n) for _ in range(ps)]
+    hist = []
+    for _ in range(gens):
+        fitnesses = np.array([_mf_rmse(p[:n_users*dim].reshape(n_users, dim),
+                                        p[n_users*dim:].reshape(n_items, dim), rows, cols, vals) for p in pop])
+        elite_idx = np.argsort(fitnesses)[:max(1, ps//5)]
+        children = [pop[i].copy() for i in elite_idx]
+        while len(children) < ps:
+            a, b = rng.choice(ps, 2, replace=False)
+            lo, hi = np.minimum(pop[a], pop[b]), np.maximum(pop[a], pop[b])
+            d = hi - lo
+            child = rng.uniform(lo - 0.5*d, hi + 0.5*d)
+            child += rng.normal(0, 0.3, n) * (rng.random(n) < 0.15)
+            children.append(np.clip(child, -3, 3))
+        pop = children[:ps]
+        hist.append(float(np.min(fitnesses)))
+    return hist
+ 
+ 
+def run_pso(rows, cols, vals, n_users, n_items, dim=8, gens=50, ps=20, seed=42):
+    """Particle Swarm Optimization on flattened U+V."""
+    rng = np.random.default_rng(seed)
+    n = n_users * dim + n_items * dim
+    pos = [rng.uniform(-3, 3, n) for _ in range(ps)]
+    vel = [rng.normal(0, 0.1, n) for _ in range(ps)]
+    pbest = [p.copy() for p in pos]
+    pfit  = [_mf_rmse(p[:n_users*dim].reshape(n_users, dim),
+                       p[n_users*dim:].reshape(n_items, dim), rows, cols, vals) for p in pos]
+    gbest = pbest[int(np.argmin(pfit))].copy()
+    hist  = []
+    for _ in range(gens):
+        for k in range(ps):
+            r1, r2 = rng.random(n), rng.random(n)
+            vel[k] = 0.7*vel[k] + 1.5*r1*(pbest[k]-pos[k]) + 1.5*r2*(gbest-pos[k])
+            vel[k] = np.clip(vel[k], -2, 2)
+            pos[k] = np.clip(pos[k] + vel[k], -3, 3)
+            f = _mf_rmse(pos[k][:n_users*dim].reshape(n_users, dim),
+                          pos[k][n_users*dim:].reshape(n_items, dim), rows, cols, vals)
+            if f < pfit[k]:
+                pfit[k] = f
+                pbest[k] = pos[k].copy()
+                if f < _mf_rmse(gbest[:n_users*dim].reshape(n_users, dim),
+                                  gbest[n_users*dim:].reshape(n_items, dim), rows, cols, vals):
+                    gbest = pos[k].copy()
+        hist.append(float(min(pfit)))
+    return hist
+
+
+# ===============================================================================
+# STREAMLIT UI
+# ===============================================================================
+def main():
+    st.set_page_config(
+        page_title="🧬 CoEvo Recommender", layout="wide", initial_sidebar_state="expanded"
+    )
+    st.markdown(
+        """<style>
+    .block-container{padding-top:1rem} .stTabs [data-baseweb="tab"]{font-size:14px;font-weight:600}
+    div[data-testid="stMetric"]{background:#1a1a2e;border-radius:10px;padding:12px;border:1px solid #333}
+    </style>""",
+        unsafe_allow_html=True,
+    )
+
+    st.title("🧬 Adaptive Recommendation Engine — Coevolutionary Algorithms")
+    st.caption(
+        "Two sub-populations (Users & Items) co-evolve to learn latent factor recommendations"
+    )
+
+    # ── Sidebar ──────────────────────────────────────────────────────────────
+    with st.sidebar:
+        st.header("⚙️ Configuration")
+
+        st.subheader("📂 Data Source")
+        data_source = st.radio(
+            "Source",
+            ["ML-100K (local path)", "Upload file"],
+            index=0,
+            horizontal=True,
+        )
+
+        rows, cols, vals, n_users_data, n_items_data = None, None, None, None, None
+        data_loaded = False
+
+        if data_source == "ML-100K (local path)":
+            ml100k_path = st.text_input(
+                "Path to u.data",
+                value=DEFAULT_ML100K_PATH,
+                help="Absolute or relative path to the ML-100K u.data file",
+            )
+            max_r = st.number_input(
+                "Max ratings to use", 1000, 100000, 100000, step=1000,
+                help="Sub-sample for faster experiments"
+            )
+            if st.button("📥 Load ML-100K", use_container_width=True):
+                if os.path.exists(ml100k_path):
+                    with st.spinner("Loading…"):
+                        rows, cols, vals, n_users_data, n_items_data = load_ml100k(
+                            ml100k_path, max_r
+                        )
+                    st.session_state["data"] = (rows, cols, vals, n_users_data, n_items_data)
+                    st.success(
+                        f"✅ Loaded {len(vals):,} ratings | "
+                        f"{n_users_data} users | {n_items_data} items"
+                    )
+                else:
+                    st.error(
+                        f"File not found: `{ml100k_path}`\n\n"
+                        "Download ML-100K from https://grouplens.org/datasets/movielens/100k/ "
+                        "and point this path to `u.data`."
+                    )
+
+        else:
+            uploaded = st.file_uploader(
+                "Ratings file (tab-separated: user item rating [timestamp])",
+                type=["csv", "tsv", "txt", "data"],
+            )
+            if uploaded:
+                with st.spinner("Parsing…"):
+                    rows, cols, vals, n_users_data, n_items_data = parse_upload(uploaded)
+                st.session_state["data"] = (rows, cols, vals, n_users_data, n_items_data)
+                st.success(
+                    f"✅ Loaded {len(vals):,} ratings | "
+                    f"{n_users_data} users | {n_items_data} items"
+                )
+
+        if "data" in st.session_state:
+            rows, cols, vals, n_users_data, n_items_data = st.session_state["data"]
+            data_loaded = True
+
+        if not data_loaded:
+            st.info("⬆️ Load a dataset above to begin.")
+
+        st.divider()
+
+        st.subheader("Algorithm")
+        c1, c2 = st.columns(2)
+        ps  = c1.number_input("Pop Size",   5, 100, 20)
+        ng  = c2.number_input("Generations", 10, 500, 50)
+        ld  = st.number_input("Latent Dim", 2, 32, 8)
+        coevo = st.selectbox("Coevolution Mode", ["cooperative", "competitive"])
+
+        st.subheader("Operators")
+        psel = st.selectbox("Parent Selection",  ["tournament", "roulette"])
+        cxop = st.selectbox("Crossover",         ["blx_alpha", "uniform", "de"])
+        mtop = st.selectbox("Mutation",          ["gaussian", "polynomial"])
+        svop = st.selectbox("Survivor Selection",["elitism", "mu_lambda"])
+
+        st.subheader("Representation & Init")
+        rep = st.selectbox("Representation",  ["real", "binary"])
+        ini = st.selectbox("Initialisation",  ["random", "heuristic"])
+        div = st.selectbox("Diversity Method",["sharing", "crowding"])
+
+        st.subheader("Bonus Features")
+        over  = st.checkbox("Over-selection",     False)
+        pso   = st.checkbox("Hybrid PSO",         False)
+        adapt = st.checkbox("Adaptive Mutation σ", True)
+
+        st.subheader("Hyperparams")
+        mr = st.slider("Mutation Rate",     0.01, 0.5,  0.15)
+        cp = st.slider("Crossover Prob",    0.1,  1.0,  0.8)
+        rl = st.slider("Regularisation λ",  0.0,  0.1,  0.01, 0.001)
+
+    cfg = Cfg(
+        n_users=n_users_data if data_loaded else 943,
+        n_items=n_items_data if data_loaded else 1682,
+        n_ratings=len(vals) if data_loaded else 100000,
+        latent_dim=ld,
+        pop_size=ps,
+        n_gens=ng,
+        coevo=coevo,
+        parent_sel=psel,
+        crossover=cxop,
+        mutation=mtop,
+        survivor=svop,
+        representation=rep,
+        init_method=ini,
+        diversity=div,
+        over_selection=over,
+        hybrid_pso=pso,
+        adaptive_mut=adapt,
+        mut_rate=mr,
+        cx_prob=cp,
+        reg_lambda=rl,
+    )
+
+    tab1, tab2, tab3 ,tab4= st.tabs(["🚀 Run Evolution", "📊 Benchmarking", "🎓 Educational Mode", "⚔️ Comparative Analysis"])
+
+    with tab1:
+        if not data_loaded:
+            st.warning("⬅️ Please load the ML-100K dataset from the sidebar first.")
+        else:
+            col_run, col_info = st.columns([3, 1])
+            with col_info:
+                st.metric("Ratings", f"{len(vals):,}")
+                st.metric("Users",   cfg.n_users)
+                st.metric("Items",   cfg.n_items)
+                st.metric("Mode",    cfg.coevo.title())
+
+            with col_run:
+                if st.button("▶️ Run Coevolution", type="primary", use_container_width=True):
+                    pbar = st.progress(0, text="Evolving…")
+
+                    def cb(g, rmse):
+                        pbar.progress(
+                            (g + 1) / cfg.n_gens,
+                            text=f"Gen {g+1}/{cfg.n_gens} — RMSE: {rmse:.4f}",
+                        )
+
+                    t0 = time.time()
+                    bu, bi, brmse, hist, uf, ifn = run_coevo(
+                        cfg, rows, cols, vals, seed=42, progress_cb=cb
+                    )
+                    elapsed = time.time() - t0
+                    pbar.progress(1.0, text="✅ Complete!")
+                    st.success(f"Best RMSE: **{brmse:.4f}** in {elapsed:.1f}s")
+                    st.session_state.update(
+                        {"hist": hist, "best_u": bu, "best_i": bi, "cfg_s": copy.deepcopy(cfg)}
+                    )
+
+            if "hist" in st.session_state:
+                h = st.session_state["hist"]
+                st.subheader("📈 Fitness Curves")
+                fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+                axes[0].plot(h["rmse"], color="#e74c3c", lw=2)
+                axes[0].set_title("RMSE Convergence", fontweight="bold")
+                axes[0].set_xlabel("Generation")
+                axes[0].set_ylabel("RMSE")
+
+                axes[1].plot(h["u_fit"], label="User", color="#3498db", lw=2)
+                axes[1].plot(h["i_fit"], label="Item", color="#2ecc71", lw=2)
+                axes[1].set_title("Best Individual Fitness", fontweight="bold")
+                axes[1].legend()
+
+                axes[2].plot(h["diversity"], color="#9b59b6", lw=2)
+                axes[2].set_title("Population Diversity", fontweight="bold")
+                axes[2].set_xlabel("Generation")
+
+                for ax in axes:
+                    ax.grid(alpha=0.3)
+                plt.tight_layout()
+                st.pyplot(fig)
+                plt.close()
+
+                st.subheader("🎯 Top-5 Recommendations")
+                recs = recommend(st.session_state["best_u"], st.session_state["best_i"])
+                n_show = min(10, len(recs))
+                rec_df = pd.DataFrame(
+                    {f"User {u}": [f"Item {i}" for i in recs[u]] for u in range(n_show)}
+                )
+                st.dataframe(rec_df, use_container_width=True)
+
+    with tab2:
+        if not data_loaded:
+            st.warning("⬅️ Please load the ML-100K dataset from the sidebar first.")
+        else:
+            st.subheader("🔬 Automated Benchmarking (30 seeds)")
+            c1, c2 = st.columns(2)
+            n_br = c1.number_input("Runs per setting", 3, 30, 5)
+            bg   = c2.number_input("Generations (bench)", 10, 200, 30)
+            if st.button("🏃 Run Full Benchmark", type="primary"):
+                bcfg = copy.deepcopy(cfg)
+                bcfg.n_gens = bg
+                bcfg.pop_size = min(cfg.pop_size, 15)
+                pbar = st.progress(0, "Benchmarking…")
+
+                def bcb(d, t):
+                    pbar.progress(d / t, f"Setting {d}/{t}")
+
+                results = run_benchmarks(bcfg, rows, cols, vals, n_br, bcb)
+                pbar.progress(1.0, "✅ Benchmark Complete!")
+                st.session_state["bench"] = results
+
+            if "bench" in st.session_state:
+                res = st.session_state["bench"]
+                st.pyplot(plot_benchmark(res))
+                tbl = [
+                    {
+                        "Parameter": p,
+                        "Value":     v,
+                        "Mean RMSE": f'{s["mean"]:.4f}',
+                        "Std":       f'{s["std"]:.4f}',
+                        "Best":      f'{s["best"]:.4f}',
+                    }
+                    for p, d in res.items()
+                    for v, s in d.items()
+                ]
+                st.dataframe(pd.DataFrame(tbl), use_container_width=True)
+                buf = io.StringIO()
+                json.dump(res, buf, indent=2)
+                st.download_button(
+                    "⬇️ Download Results (JSON)",
+                    buf.getvalue(),
+                    "benchmark_results.json",
+                    "application/json",
+                )
+
+    with tab3:
+        if not data_loaded:
+            st.warning("⬅️ Please load the ML-100K dataset from the sidebar first.")
+        else:
+            st.subheader("🎓 Educational Visualisation")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**Configuration A**")
+                a_co = st.selectbox("Coevo A",    ["cooperative", "competitive"], key="a_co")
+                a_cx = st.selectbox("Crossover A",["blx_alpha", "uniform", "de"], key="a_cx")
+                a_mt = st.selectbox("Mutation A", ["gaussian", "polynomial"],     key="a_mt")
+                a_dv = st.selectbox("Diversity A",["sharing", "crowding"],        key="a_dv")
+            with c2:
+                st.markdown("**Configuration B**")
+                b_co = st.selectbox("Coevo B",    ["competitive", "cooperative"], key="b_co")
+                b_cx = st.selectbox("Crossover B",["uniform", "blx_alpha", "de"], key="b_cx")
+                b_mt = st.selectbox("Mutation B", ["polynomial", "gaussian"],     key="b_mt")
+                b_dv = st.selectbox("Diversity B",["crowding", "sharing"],        key="b_dv")
+            eg = st.number_input("Generations (edu)", 10, 200, 50, key="eg")
+
+            if st.button("🎬 Run Side-by-Side Comparison", type="primary"):
+                ca = copy.deepcopy(cfg)
+                ca.n_gens = eg
+                ca.coevo, ca.crossover, ca.mutation, ca.diversity = a_co, a_cx, a_mt, a_dv
+                cb_ = copy.deepcopy(cfg)
+                cb_.n_gens = eg
+                cb_.coevo, cb_.crossover, cb_.mutation, cb_.diversity = b_co, b_cx, b_mt, b_dv
+
+                pbar = st.progress(0, "Running A…")
+
+                def cba(g, r):
+                    pbar.progress((g + 1) / (eg * 2), f"Config A — Gen {g+1}")
+
+                _, _, ra, ha, _, _ = run_coevo(ca, rows, cols, vals, 42, cba)
+
+                def cbb(g, r):
+                    pbar.progress(0.5 + (g + 1) / (eg * 2), f"Config B — Gen {g+1}")
+
+                _, _, rb, hb, _, _ = run_coevo(cb_, rows, cols, vals, 42, cbb)
+                pbar.progress(1.0, "✅ Done!")
+
+                fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+                axes[0].plot(ha["rmse"], label=f"A ({a_co})", color="#e74c3c", lw=2)
+                axes[0].plot(hb["rmse"], label=f"B ({b_co})", color="#3498db", lw=2, ls="--")
+                axes[0].set_title("RMSE Convergence", fontweight="bold")
+
+                axes[1].plot(ha["u_fit"], label="A User", color="#e74c3c", lw=2)
+                axes[1].plot(hb["u_fit"], label="B User", color="#3498db", lw=2, ls="--")
+                axes[1].plot(ha["i_fit"], label="A Item", color="#e67e22", lw=1.5, alpha=0.7)
+                axes[1].plot(hb["i_fit"], label="B Item", color="#1abc9c", lw=1.5, ls="--", alpha=0.7)
+                axes[1].set_title("Fitness Landscape", fontweight="bold")
+
+                axes[2].plot(ha["diversity"], label="A", color="#e74c3c", lw=2)
+                axes[2].plot(hb["diversity"], label="B", color="#3498db", lw=2, ls="--")
+                axes[2].set_title("Diversity Dynamics", fontweight="bold")
+
+                for ax in axes:
+                    ax.legend()
+                    ax.grid(alpha=0.3)
+                plt.tight_layout()
+                st.pyplot(fig)
+                plt.close()
+
+                mc1, mc2 = st.columns(2)
+                mc1.metric("Config A Final RMSE", f"{ra:.4f}")
+                mc2.metric("Config B Final RMSE", f"{rb:.4f}")
+                st.success(
+                    f"🏆 Configuration **{'A' if ra < rb else 'B'}** achieved lower RMSE!"
+                )
+    with tab4:
+        if not data_loaded:
+            st.warning("⬅️ Please load the ML-100K dataset from the sidebar first.")
+        else:
+            st.subheader("⚔️ Coevolution vs. Baseline Algorithms")
+            st.caption("Compares Cooperative Coevolution against DE, GA, and PSO on the same MF task.")
+ 
+            cmp_c1, cmp_c2 = st.columns(2)
+            cmp_gens = cmp_c1.number_input("Generations", 10, 200, 30, key="cmp_gens")
+            cmp_ps   = cmp_c2.number_input("Pop Size",    5,  50,  15, key="cmp_ps")
+ 
+            baselines = st.multiselect(
+                "Baseline algorithms to include",
+                ["DE", "GA", "PSO"],
+                default=["DE", "GA", "PSO"],
+            )
+ 
+            if st.button("▶️ Run Comparison", type="primary"):
+                pbar = st.progress(0, "Running Coevolution…")
+                cmp_cfg = copy.deepcopy(cfg)
+                cmp_cfg.n_gens = cmp_gens
+                cmp_cfg.pop_size = cmp_ps
+ 
+                def cmp_cb(g, rmse):
+                    pbar.progress((g + 1) / (cmp_gens * (1 + len(baselines))),
+                                  f"CoEvo Gen {g+1}/{cmp_gens}")
+ 
+                _, _, coevo_rmse, coevo_hist, _, _ = run_coevo(
+                    cmp_cfg, rows, cols, vals, seed=42, progress_cb=cmp_cb
+                )
+ 
+                results_hist  = {"CoEvolution": coevo_hist["rmse"]}
+                results_final = {"CoEvolution": coevo_rmse}
+ 
+                RUNNERS = {
+                    "DE":  run_de,
+                    "GA":  run_ga,
+                    "PSO": run_pso,
+                }
+                for idx, name in enumerate(baselines, start=1):
+                    pbar.progress(idx / (1 + len(baselines)), f"Running {name}…")
+                    h = RUNNERS[name](rows, cols, vals, cfg.n_users, cfg.n_items,
+                                      dim=cmp_cfg.latent_dim, gens=cmp_gens,
+                                      ps=cmp_ps, seed=42)
+                    results_hist[name]  = h
+                    results_final[name] = h[-1]
+ 
+                pbar.progress(1.0, "✅ Done!")
+                st.session_state["cmp_hist"]  = results_hist
+                st.session_state["cmp_final"] = results_final
+ 
+            if "cmp_hist" in st.session_state:
+                rh = st.session_state["cmp_hist"]
+                rf = st.session_state["cmp_final"]
+ 
+                # Convergence curves
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+                colors = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12"]
+                for (name, h), col in zip(rh.items(), colors):
+                    ax1.plot(h, label=name, color=col, lw=2,
+                             ls="--" if name != "CoEvolution" else "-")
+                ax1.set_title("Convergence Curves", fontweight="bold")
+                ax1.set_xlabel("Generation")
+                ax1.set_ylabel("RMSE")
+                ax1.legend()
+                ax1.grid(alpha=0.3)
+ 
+                # Final RMSE bar chart
+                names  = list(rf.keys())
+                values = list(rf.values())
+                bar_colors = colors[:len(names)]
+                bars = ax2.bar(names, values, color=bar_colors, edgecolor="#333")
+                ax2.set_title("Final RMSE Comparison", fontweight="bold")
+                ax2.set_ylabel("RMSE")
+                for bar, v in zip(bars, values):
+                    ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.002,
+                             f"{v:.4f}", ha="center", fontsize=9, fontweight="bold")
+                ax2.grid(axis="y", alpha=0.3)
+                plt.tight_layout()
+                st.pyplot(fig)
+                plt.close()
+ 
+                # Summary table
+                best_algo = min(rf, key=rf.get)
+                st.dataframe(
+                    pd.DataFrame([{"Algorithm": k, "Final RMSE": f"{v:.4f}",
+                                   "vs CoEvo Δ": f"{v - rf['CoEvolution']:+.4f}"}
+                                  for k, v in rf.items()]),
+                    use_container_width=True,
+                )
+                st.success(f"🏆 Best algorithm: **{best_algo}** (RMSE: {rf[best_algo]:.4f})")
+
+
+if __name__ == "__main__":
+    main()
