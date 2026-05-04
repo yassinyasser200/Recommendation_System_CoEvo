@@ -242,7 +242,7 @@ def cx_de(target, pop, f, cr, rng):
     mutant = pop[idxs[0]] + f * (pop[idxs[1]] - pop[idxs[2]])
     mask = rng.random(target.shape) < cr
     # Guarantee at least one gene comes from mutant (random dimension, not always dim-0)
-    rand_dim = rng.integers(0, target.shape[1]) if target.ndim > 1 else 0
+    rand_dim = rng.integers(0, target.shape[1]) if target.ndim > 1 else 0 #2D Matrix: If the target has more than one dimension, it uses rng.integers(0, target.shape[1]) to pick a random integer between 0 and the total number of latent dimensions (columns). 1D Vector: If the target is only one-dimensional, it defaults the value to 0.
     if target.ndim > 1:
         mask[:, rand_dim] = True
     else:
