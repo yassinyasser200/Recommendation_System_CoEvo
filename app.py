@@ -54,7 +54,7 @@ SEEDS = list(range(1, 31))  # 30 fixed seeds for benchmarking
 # ===============================================================================
 # ML-100K DATA LOADER
 # ===============================================================================
-DEFAULT_ML100K_PATH = "./ml-100k/u.data"
+DEFAULT_ML100K_PATH = "data/ml-100k/u.data"
 
 @st.cache_data(show_spinner=False)
 def load_ml100k(path: str, max_ratings: int = 100000):
