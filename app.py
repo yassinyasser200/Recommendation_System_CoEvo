@@ -116,23 +116,7 @@ def init_pop(ps, n_ent, dim, method, bounds, rng, idx_arr=None, val_arr=None):
 # FITNESS & CONSTRAINTS
 # ===============================================================================
 def calc_fitness(u_pop, i_pop, r, c, v, reg, coevo):
-    """
-    FIX 1 — Representative selection:
-    Original code always used index-0 as representative, which is only correct
-    in generation 0. After the first swap (best→index-0), it accidentally works,
-    but it is fragile: if survivor selection reorders the list, the best is no
-    longer guaranteed to be at index 0.
 
-    FIX: explicitly find the best individual by fitness before using it as
-    representative, rather than hardcoding index 0.
-
-    FIX 2 — Competitive item fitness sign:
-    In competitive mode the item fitness is negated so items 'try' to maximise
-    user prediction error. The original code negated AFTER regularisation was
-    added, which means the regularisation term was also negated (i.e., rewarding
-    large weights). Fixed to negate only the RMSE component, keeping regularisation
-    always positive (penalising large weights).
-    """
     n_u, n_i = len(u_pop), len(i_pop)
     u_fit = np.full(n_u, np.inf)
     i_fit = np.full(n_i, np.inf)
@@ -173,16 +157,7 @@ repair = lambda ind, b: np.clip(ind, b[0], b[1])
 # SELECTION OPERATORS
 # ===============================================================================
 def select_parents(fit, n, method, k, rng):
-    """
-    FIX 3 — Roulette wheel with negative fitness:
-    In competitive mode item fitness values are negative. The original roulette
-    implementation computed inv = 1/(fit - fit.min() + 1e-8). When all values
-    are negative and close together, fit - fit.min() ≈ 0 for all, making every
-    individual equally likely — effectively random selection.
 
-    FIX: shift fitness so the worst individual gets probability proportional to
-    epsilon and the best gets the highest weight, regardless of sign.
-    """
     if method == "tournament":
         cands = rng.integers(0, len(fit), (n, k))
         return cands[np.arange(n), np.argmin(fit[cands], axis=1)]
@@ -193,12 +168,7 @@ def select_parents(fit, n, method, k, rng):
 
 
 def over_select(fit, n, top_f, rng):
-    """
-    FIX 4 — over_select index bounds:
-    When n_ch (number of children) > pop_size, rng.choice(si[tn:], n - nt) can
-    request more samples than elements available if the bottom group is small.
-    Added replace=True to allow resampling from the bottom group safely.
-    """
+
     si = np.argsort(fit)
     tn = max(1, int(len(fit) * top_f)) #choice the top tier individuals, at least 1
     nt = int(n * 0.8)# choose 80% parents from the potentially best individuals, and 20% from the best individuals
@@ -226,14 +196,7 @@ def cx_blx(p1, p2, alpha, pr, rng):
 
 
 def cx_de(target, pop, f, cr, rng):
-    """
-    FIX 5 — DE crossover requires at least 3 distinct individuals:
-    Original code called rng.choice(len(pop), 3, replace=False) which raises
-    ValueError if pop_size < 3 (possible in benchmarking with pop_size=15 reduced
-    further). Added a fallback to uniform crossover when population is too small.
-    Also fixed: mask[0] = True sets only the first gene, not a random mandatory
-    gene as DE/rand/1/bin specifies. Fixed to use a random mandatory dimension.
-    """
+  
     if len(pop) < 3:
         # Fallback: uniform crossover when population too small for DE
         m = rng.random(target.shape) < cr
@@ -259,18 +222,13 @@ CX = {
 
 def mut_gauss(ind, sigma, rate, rng):
     m = rng.random(ind.shape) < rate
-    return ind + m * rng.normal(0, sigma, ind.shape)
+    return ind + m * rng.normal(0, sigma, ind.shape)# How it works: rng.random(ind.shape) creates a grid of random numbers between 0 and 1. By checking if they are < rate, it creates a Boolean Mask (True or False).
+
+#Result: If your rate is 0.1, roughly 10% of the positions in the mask will be True (marked for mutation), and the rest will be False.
 
 
 def mut_poly(ind, eta, rate, brange, rng):
-    """
-    FIX 6 — Polynomial mutation formula:
-    The original formula used delta in [-1, 1] but missed the eta-dependent
-    scaling on the u >= 0.5 branch. The correct SBM (Simulated Binary Mutation)
-    formula for u >= 0.5 is: delta = 1 - (2*(1-u))^(1/(eta+1)).
-    The original had this correct but was missing the sign flip for the perturbation
-    direction on the u < 0.5 branch. Fixed to match Deb's original SBM definition.
-    """
+  
     m = rng.random(ind.shape) < rate
     u = rng.random(ind.shape)
     delta = np.where(
@@ -296,13 +254,7 @@ adapt_sigma = lambda sig, rng, tau=0.1: np.clip(
 # DIVERSITY & SURVIVOR SELECTION
 # ===============================================================================
 def fitness_sharing(fit, pop_list, sigma, alpha):
-    """
-    FIX 7 — Fitness sharing with negative values:
-    In competitive mode fit contains negative values. Multiplying negative fitness
-    by a sharing factor >= 1 makes fitness MORE negative (i.e., apparently better),
-    which is the opposite of the intended penalty. Fixed to work on absolute
-    fitness for the sharing denominator, then restore sign.
-    """
+ 
     flat = np.array([p.ravel() for p in pop_list])
     d = np.sqrt(((flat[:, None] - flat[None, :]) ** 2).sum(2))
     sh = np.where(d < sigma, 1 - (d / sigma) ** alpha, 0).sum(1)
@@ -325,16 +277,7 @@ def crowding_dist(fit):
 
 
 def surv_select(pop, fit, sig, ps):
-    """
-    FIX 8 — Survivor selection with negative fitness (competitive mode):
-    np.argsort(fit)[:ps] always picks the most negative values first, which in
-    competitive mode are the WORST item individuals (most negative = lowest RMSE
-    from items' adversarial perspective is actually bad for the system).
-    Fixed to sort by absolute value for competitive items, but the caller already
-    handles this by passing abs(i_fit) only when needed. Here we sort ascending
-    which is correct for both modes since: cooperative=minimise, competitive=
-    most-negative-is-best (argmin already handles this correctly).
-    """
+
     idx = np.argsort(fit)[:ps]
     return [pop[i] for i in idx], fit[idx], sig[idx]
 
@@ -343,12 +286,7 @@ def surv_select(pop, fit, sig, ps):
 # HYBRID PSO
 # ===============================================================================
 def pso_step(pop, vel, pbest, gbest, w, c1, c2, rng):
-    """
-    FIX 9 — PSO velocity clipping:
-    Unbounded velocity can cause particles to fly far outside the search space
-    even after the repair clip on positions. Added velocity clamping to [-2, 2]
-    to prevent velocity explosion over many generations.
-    """
+
     new_pop, new_vel = [], []
     v_max = 2.0
     for p, v, pb in zip(pop, vel, pbest):
